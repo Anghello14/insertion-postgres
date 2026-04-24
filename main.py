@@ -11,6 +11,7 @@ from extract.excel_reader import ExcelExtractor
 from transform.profiler_data import DataProfiler
 from load.insert_postgres import PostgresLoader
 from load.reporte_derrotero import generar_reporte_auditoria
+from load.reporte_maestro import generar_reporte_maestro
 
 # Cargar variables de entorno
 load_dotenv()
@@ -161,6 +162,9 @@ def ejecutar_pipeline():
     # ── Cierre y resumen global ───────────────────────────────────────────────
     loader.cerrar()
     t_total = time.perf_counter() - t0_global
+
+    # ── Reporte maestro ──────────────────────────────────────────────────────
+    generar_reporte_maestro(OUTPUT_DIR, timestamp)
 
     logging.info("")
     logging.info("=" * 80)
