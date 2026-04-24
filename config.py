@@ -33,4 +33,4 @@ DATA_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "30000"))

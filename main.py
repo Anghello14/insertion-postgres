@@ -1,119 +1,183 @@
-"""
-main.py
-Punto de entrada del pipeline ETL.
-
-Flujo:
-  1. Configurar logging (consola + archivo)
-  2. Cargar configuración desde .env
-  3. EXTRACT  — leer archivos .xlsx del directorio data/
-  4. TRANSFORM — perfilar los datos crudos (sin limpieza)
-  5. LOAD      — conectar a PostgreSQL e insertar los datos crudos,
-                 documentando todos los errores
-"""
-from __future__ import annotations
-
-import sys
+import os
 import time
+import logging
+import traceback
+from datetime import datetime
+from pathlib import Path
 
-import config
-from logger_config import setup_logger
-from extract.extractor import load_xlsx_files
-from transform.profiler import profile_all
-from load.loader import get_connection, load_all
+from dotenv import load_dotenv
+
+from extract.excel_reader import ExcelExtractor
+from transform.profiler_data import DataProfiler
+from load.insert_postgres import PostgresLoader
+from load.reporte_derrotero import generar_reporte_auditoria
+
+# Cargar variables de entorno
+load_dotenv()
+
+# ── Rutas ────────────────────────────────────────────────────────────────────
+BASE_DIR   = Path(__file__).resolve().parent
+INPUT_DIR  = BASE_DIR / "data" / "input"
+OUTPUT_DIR = BASE_DIR / "data" / "output"
+LOG_DIR    = BASE_DIR / "logs"
+
+for folder in [INPUT_DIR, OUTPUT_DIR, LOG_DIR]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_archivo = LOG_DIR / f"ejecucion_migracion_{timestamp}.log"
+
+logging.basicConfig(
+    level=logging.DEBUG,                    # DEBUG → capturamos todo
+    format='%(asctime)s [%(levelname)-8s] %(message)s',
+    handlers=[
+        logging.FileHandler(log_archivo, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+# Los módulos de terceros generan mucho ruido en DEBUG; los silenciamos
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('openpyxl').setLevel(logging.WARNING)
 
 
-def main() -> int:
-    # ── 0. Logger ─────────────────────────────────────────────────────────────
-    logger = setup_logger(config.LOGS_DIR)
-    logger.info("=" * 70)
-    logger.info("PIPELINE ETL INICIADO")
-    logger.info("  data_dir   : %s", config.DATA_DIR)
-    logger.info("  logs_dir   : %s", config.LOGS_DIR)
-    logger.info("  batch_size : %d", config.BATCH_SIZE)
-    logger.info("  db_host    : %s", config.DB_HOST)
-    logger.info("  db_port    : %d", config.DB_PORT)
-    logger.info("  db_name    : %s", config.DB_NAME)
-    logger.info("  db_schema  : %s", config.DB_SCHEMA)
-    logger.info("=" * 70)
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-    pipeline_start = time.perf_counter()
+def _hms(segundos: float) -> str:
+    m, s = divmod(int(segundos), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}h {m:02d}m {s:02d}s"
 
-    # ── 1. EXTRACT ────────────────────────────────────────────────────────────
-    logger.info("FASE 1 — EXTRACT")
-    datasets = load_xlsx_files(config.DATA_DIR)
 
-    if not datasets:
-        logger.warning(
-            "No hay datasets para procesar. "
-            "Coloque archivos .xlsx en '%s' y vuelva a ejecutar.",
-            config.DATA_DIR,
-        )
-        logger.info("Pipeline finalizado sin datos.")
-        return 0
+# ── Pipeline ─────────────────────────────────────────────────────────────────
 
-    # ── 2. TRANSFORM (perfilado) ──────────────────────────────────────────────
-    logger.info("FASE 2 — TRANSFORM (perfilado, sin limpieza)")
-    profiles = profile_all(datasets)
+def ejecutar_pipeline():
+    t0_global = time.perf_counter()
 
-    # ── 3. LOAD ───────────────────────────────────────────────────────────────
-    logger.info("FASE 3 — LOAD")
+    logging.info("=" * 80)
+    logging.info(f"INICIANDO PIPELINE DE AUDITORIA Y CARGA CRUDA - ID: {timestamp}")
+    logging.info("=" * 80)
+    logging.info(f"Directorio base   : {BASE_DIR}")
+    logging.info(f"Directorio input  : {INPUT_DIR}")
+    logging.info(f"Directorio output : {OUTPUT_DIR}")
+    logging.info(f"Archivo de log    : {log_archivo}")
 
-    if not config.DB_NAME or not config.DB_USER:
-        logger.error(
-            "Credenciales de base de datos incompletas. "
-            "Configure DB_NAME y DB_USER en el archivo .env y reintente."
-        )
-        return 1
+    # ── Variables de entorno ─────────────────────────────────────────────────
+    db_host = os.getenv("DB_HOST")
+    db_name = os.getenv("DB_NAME")
+    db_user = os.getenv("DB_USER")
+    db_pass = os.getenv("DB_PASSWORD")
+    db_port = os.getenv("DB_PORT", "5432")
 
+    logging.info(f"Config BD -> host={db_host} db={db_name} user={db_user} port={db_port}")
+
+    missing = [k for k, v in {"HOST": db_host, "DB": db_name, "USER": db_user, "PASS": db_pass}.items()
+               if v is None]
+    if missing:
+        logging.critical(f"Faltan variables en .env: {missing}. Abortando.")
+        return
+
+    # ── Conexión ─────────────────────────────────────────────────────────────
     try:
-        conn = get_connection(
-            host=config.DB_HOST,
-            port=config.DB_PORT,
-            dbname=config.DB_NAME,
-            user=config.DB_USER,
-            password=config.DB_PASSWORD,
-        )
-    except Exception:
-        logger.critical(
-            "No se pudo establecer la conexión con PostgreSQL. "
-            "Verifique la configuración en .env y que el servidor esté activo."
-        )
-        return 1
+        loader = PostgresLoader(host=db_host, database=db_name,
+                                user=db_user, password=db_pass, port=db_port)
+        loader.conectar()
+    except Exception as e:
+        logging.critical(f"No se pudo establecer comunicacion con el motor Postgres: {e}")
+        logging.debug(traceback.format_exc())
+        return
 
-    try:
-        load_results = load_all(
-            conn=conn,
-            schema=config.DB_SCHEMA,
-            datasets=datasets,
-            batch_size=config.BATCH_SIZE,
-        )
-    finally:
-        conn.close()
-        logger.info("Conexión a PostgreSQL cerrada.")
+    # ── Escaneo de archivos ──────────────────────────────────────────────────
+    archivos_excel = sorted([
+        f for f in os.listdir(INPUT_DIR)
+        if f.endswith('.xlsx') and not f.startswith('~$')
+    ])
+    total_archivos = len(archivos_excel)
+    logging.info(f"Se detectaron {total_archivos} archivos .xlsx para procesar: {archivos_excel}")
 
-    # ── Resumen final ─────────────────────────────────────────────────────────
-    pipeline_elapsed = time.perf_counter() - pipeline_start
-    total_errors = sum(
-        len(r.get("todos_los_errores", [])) for r in load_results.values()
-    )
+    # Contadores globales
+    g_exitos = g_fallas = g_errores_criticos = 0
 
-    logger.info("=" * 70)
-    logger.info("PIPELINE ETL FINALIZADO en %.4f s", pipeline_elapsed)
-    logger.info(
-        "Tablas procesadas: %d | Errores totales documentados: %d",
-        len(load_results),
-        total_errors,
-    )
+    for i, nombre_archivo in enumerate(archivos_excel, 1):
+        ruta_completa = INPUT_DIR / nombre_archivo
+        t0_archivo    = time.perf_counter()
 
-    if total_errors > 0:
-        logger.warning(
-            "Se documentaron %d error(es) durante la carga. "
-            "Revise el archivo de log para el análisis detallado.",
-            total_errors,
-        )
+        logging.info("")
+        logging.info("-" * 80)
+        logging.info(f"[{i}/{total_archivos}] PROCESANDO: {nombre_archivo}  "
+                     f"(tamano: {ruta_completa.stat().st_size / 1024:.1f} KB)")
+        logging.info("-" * 80)
 
-    return 0
+        try:
+            # ── A. EXTRACCIÓN ────────────────────────────────────────────────
+            t0 = time.perf_counter()
+            extractor = ExcelExtractor(ruta_completa)
+            df_estructura, df_datos = extractor.extraer_datos_y_estructura()
+            nombre_tabla = extractor.nombre_tabla
+            logging.info(f"[{nombre_tabla}] Extraccion completada en "
+                         f"{time.perf_counter()-t0:.2f}s | "
+                         f"{len(df_datos)} filas | {len(df_datos.columns)} cols")
+
+            # Muestra de las primeras 3 filas para auditoria visual
+            logging.debug(f"[{nombre_tabla}] Primeras filas del origen:\n{df_datos.head(3).to_string()}")
+
+            # ── B. PERFILADO ─────────────────────────────────────────────────
+            t0 = time.perf_counter()
+            profiler = DataProfiler(df_datos, nombre_tabla)
+            df_crudo, df_perfilado = profiler.perfilar_datos_crudos()
+            logging.info(f"[{nombre_tabla}] Perfilado completado en {time.perf_counter()-t0:.2f}s")
+
+            # ── C. CARGA + DERROTERO ─────────────────────────────────────────
+            t0 = time.perf_counter()
+            loader.crear_tabla(nombre_tabla, df_estructura)
+            df_derrotero = loader.cargar_datos_con_derrotero(nombre_tabla, df_crudo)
+            t_carga = time.perf_counter() - t0
+
+            exitos = len(df_crudo) - len(df_derrotero)
+            fallas = len(df_derrotero)
+            g_exitos += exitos
+            g_fallas += fallas
+
+            velocidad = len(df_crudo) / t_carga if t_carga > 0 else 0
+            logging.info(f"[{nombre_tabla}] Carga completada en {t_carga:.2f}s | "
+                         f"~{velocidad:.0f} reg/s | OK {exitos} | FAIL {fallas}")
+
+            # ── D. REPORTE ───────────────────────────────────────────────────
+            t0 = time.perf_counter()
+            generar_reporte_auditoria(nombre_tabla, df_perfilado, df_derrotero,
+                                      exitos, fallas, OUTPUT_DIR)
+            logging.info(f"[{nombre_tabla}] Reporte generado en {time.perf_counter()-t0:.2f}s")
+
+            t_total_archivo = time.perf_counter() - t0_archivo
+            logging.info(f"[{nombre_tabla}] ARCHIVO FINALIZADO en {_hms(t_total_archivo)} | "
+                         f"OK {exitos} exitos | FAIL {fallas} fallas")
+
+        except Exception as e:
+            g_errores_criticos += 1
+            logging.error(f"FALLO CRITICO procesando {nombre_archivo}: {e}")
+            logging.error(traceback.format_exc())   # traceback completo al log
+            continue
+
+    # ── Cierre y resumen global ───────────────────────────────────────────────
+    loader.cerrar()
+    t_total = time.perf_counter() - t0_global
+
+    logging.info("")
+    logging.info("=" * 80)
+    logging.info("RESUMEN GLOBAL DEL PIPELINE")
+    logging.info("=" * 80)
+    logging.info(f"Archivos procesados     : {total_archivos}")
+    logging.info(f"Errores criticos (skip) : {g_errores_criticos}")
+    logging.info(f"Inserciones exitosas    : {g_exitos}")
+    logging.info(f"Inserciones fallidas    : {g_fallas}")
+    total_reg = g_exitos + g_fallas
+    if total_reg > 0:
+        logging.info(f"Tasa de exito global    : {g_exitos/total_reg*100:.2f}%")
+    logging.info(f"Tiempo total de ejecucion: {_hms(t_total)}")
+    logging.info(f"Reportes de auditoria en : {OUTPUT_DIR}")
+    logging.info(f"Log completo en          : {log_archivo}")
+    logging.info("=" * 80)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    ejecutar_pipeline()

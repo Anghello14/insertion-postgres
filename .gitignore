@@ -34,3 +34,4 @@ Thumbs.db
 # Data files with real content (keep sample only)
 data/*.xlsx
 !data/sample_data.xlsx
+*.xlsx
