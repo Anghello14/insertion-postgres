@@ -97,7 +97,7 @@ def ejecutar_pipeline():
     logging.info(f"Se detectaron {total_archivos} archivos .xlsx para procesar: {archivos_excel}")
 
     # Contadores globales
-    g_exitos = g_fallas = g_errores_criticos = 0
+    g_exitos = g_fallas = g_errores_criticos = g_skips = 0
 
     for i, nombre_archivo in enumerate(archivos_excel, 1):
         ruta_completa = INPUT_DIR / nombre_archivo
@@ -108,6 +108,15 @@ def ejecutar_pipeline():
         logging.info(f"[{i}/{total_archivos}] PROCESANDO: {nombre_archivo}  "
                      f"(tamano: {ruta_completa.stat().st_size / 1024:.1f} KB)")
         logging.info("-" * 80)
+
+        # ── Idempotencia: saltar si ya existe el reporte de auditoría ────────
+        nombre_tabla_previo = Path(nombre_archivo).stem
+        reporte_previo = OUTPUT_DIR / f"AUDITORIA_{nombre_tabla_previo}.xlsx"
+        if reporte_previo.exists():
+            g_skips += 1
+            logging.info(f"[{nombre_tabla_previo}] SKIP: ya existe reporte de auditoria en "
+                         f"'{reporte_previo.name}'. Archivo omitido por idempotencia.")
+            continue
 
         try:
             # ── A. EXTRACCIÓN ────────────────────────────────────────────────
@@ -171,6 +180,7 @@ def ejecutar_pipeline():
     logging.info("RESUMEN GLOBAL DEL PIPELINE")
     logging.info("=" * 80)
     logging.info(f"Archivos procesados     : {total_archivos}")
+    logging.info(f"Archivos skipped (ya OK): {g_skips}")
     logging.info(f"Errores criticos (skip) : {g_errores_criticos}")
     logging.info(f"Inserciones exitosas    : {g_exitos}")
     logging.info(f"Inserciones fallidas    : {g_fallas}")
